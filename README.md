@@ -1,3 +1,7 @@
+## Note on Initial Demo Load:
+Because the backend is hosted on Render’s free tier, the instance automatically spins down after periods of inactivity. Waking it up triggers a cold start that takes about 50 to 60 seconds.   Once you launch the live demo/deployment, please wait 1 minute and refresh the page until you see the API LIVE / FALKOR DB ACTIVE status indicator highlighted in green in the top-middle header before interacting with the application.
+
+
 # GraphGenie: Context-Aware Multi-Agent GraphRAG & Living Company Brain
 
 Built on **FalkorDB Cloud**, **FastAPI**, **Voyage AI (`voyage-4-lite`)**, **OpenRouter (Nvidia Nemotron)**, and **Zoho Catalyst Cloud File Store**.
