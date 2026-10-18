@@ -15,6 +15,7 @@ Graph Schema:
 
 import hashlib
 import json
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
@@ -184,16 +185,12 @@ class GraphBuilder:
         source_id = self._entity_id(source_name, source_type)
         target_id = self._entity_id(target_name, target_type)
 
-        # Map common relation types to typed Cypher relationships
-        typed_relations = {
-            "IS_A", "HAS", "WORKS_FOR", "LOCATED_IN", "PART_OF",
-            "RELATED_TO", "CAUSED_BY", "LEADS_TO", "USES", "CREATED_BY",
-            "DEPENDS_ON", "MEASURED_BY", "MENTIONS", "OCCURRED_AT",
-        }
-
-        rel_type = relation_type.upper().replace(" ", "_").replace("-", "_")
-        if rel_type not in typed_relations:
-            rel_type = "RELATED_TO"
+        # Sanitize relation type into a valid Cypher relationship identifier
+        clean_rel = re.sub(r"[^A-Za-z0-9_]", "_", relation_type.strip()).upper()
+        # Ensure it starts with a letter and is between 2 and 40 characters
+        if not clean_rel or not clean_rel[0].isalpha():
+            clean_rel = "RELATED_TO"
+        rel_type = clean_rel[:40]
 
         cypher = f"""
         MATCH (s:Entity {{id: $source_id}})

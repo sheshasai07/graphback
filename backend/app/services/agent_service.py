@@ -1,7 +1,8 @@
 """
 GraphGenie - Multi-Agent Orchestration Service
 Implements Investigator Agent, Resolver Agent, Episodic Memory Routing,
-GraphRAG Impact Traversal, and Reasoning Trail Generation.
+GraphRAG Impact Traversal, and Reasoning Trail Generation directly connected
+to FalkorDB Cloud with in-memory fallback.
 """
 
 import time
@@ -10,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from loguru import logger
 
+from app.config import settings
 from app.db.falkordb_client import db_client
 from app.services.embedding_service import embedding_service
 from app.services.llm_service import llm_service
@@ -38,57 +40,96 @@ class GraphGenieAgentService:
     def __init__(self):
         pass
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Helper: Extract Keywords & Seed Entities
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Entity & Topology Extraction from FalkorDB
+    # -------------------------------------------------------------------------
 
-    def _extract_target_entities(self, text: str) -> Dict[str, Any]:
-        """Detect referenced services, features, or persons in the text."""
+    async def _extract_target_entities(self, text: str) -> Dict[str, Any]:
+        """Detect referenced services, features, or persons directly from FalkorDB knowledge graph."""
         lowered = text.lower()
-        mem_engine = getattr(db_client, "_in_memory_engine", None)
-
         matched_services = []
         matched_features = []
         matched_persons = []
 
-        # Check services
-        if mem_engine and mem_engine.services:
-            for s in mem_engine.services.values():
-                if s["name"].lower() in lowered or s["id"].lower() in lowered:
-                    matched_services.append(s)
-        else:
-            # Fallback service names
+        # 1. Query FalkorDB Entities and domain nodes directly
+        try:
+            cypher = """
+            MATCH (e)
+            WHERE e:Entity OR e:Service OR e:Feature OR e:Person
+            RETURN labels(e)[0], e.id, e.name, e.type, e.description
+            LIMIT 100
+            """
+            res = await db_client.aquery(cypher)
+            for row in (res.result_set or []):
+                elabel = str(row[0] or "")
+                eid = str(row[1] or "")
+                ename = str(row[2] or eid or "")
+                etype = str(row[3] or elabel)
+                edesc = str(row[4] or "")
+
+                if not ename:
+                    continue
+
+                # Skip 1 or 2 letter noise entities like "ID", "IN", "ON"
+                if len(ename.strip()) <= 2:
+                    continue
+
+                # Match whole words only so "id" inside "Did" never triggers a false match
+                if re.search(rf"\b{re.escape(ename.lower())}\b", lowered):
+                    ent_data = {"id": eid or ename, "name": ename, "type": etype, "description": edesc}
+                    if elabel == "Service" or etype in ("Service", "Technology", "Infrastructure"):
+                        ent_data["criticality"] = "Tier-1"
+                        ent_data["runtime"] = "Cloud"
+                        matched_services.append(ent_data)
+                    elif elabel == "Feature" or etype in ("Feature", "Role", "AccessLevel", "Status"):
+                        ent_data["status"] = "active"
+                        ent_data["stage"] = "prod"
+                        matched_features.append(ent_data)
+                    elif elabel == "Person" or etype in ("Person", "Account", "Identifier"):
+                        ent_data["email"] = f"{ename.lower().replace(' ', '.')}@enterprise.internal"
+                        ent_data["role"] = etype
+                        ent_data["on_call"] = True
+                        matched_persons.append(ent_data)
+                    else:
+                        ent_data["criticality"] = "Tier-2"
+                        matched_services.append(ent_data)
+        except Exception as e:
+            logger.debug(f"FalkorDB target entity query note: {e}")
+
+        # 2. Check in-memory engine fallback if FalkorDB yielded no specific matches
+        mem_engine = getattr(db_client, "_in_memory_engine", None)
+        if not matched_services and not matched_features and mem_engine:
+            if mem_engine.services:
+                for s in mem_engine.services.values():
+                    if s["name"].lower() in lowered or s["id"].lower() in lowered:
+                        matched_services.append(s)
+            if mem_engine.features:
+                for f in mem_engine.features.values():
+                    if f["name"].lower() in lowered or f["name"].replace(" ", "").lower() in lowered:
+                        matched_features.append(f)
+            if mem_engine.persons:
+                for p in mem_engine.persons.values():
+                    if p["name"].lower() in lowered or p["name"].split()[0].lower() in lowered:
+                        matched_persons.append(p)
+
+        # 3. Default fallbacks if none matched
+        if not matched_services and not matched_features:
             for name in ["AuthService", "APIGateway", "NotificationGateway", "UserDirectory", "BillingService", "SessionStore"]:
                 if name.lower() in lowered:
-                    matched_services.append({"name": name, "criticality": "Tier-1", "runtime": "Go"})
-
-        # Check features
-        if mem_engine and mem_engine.features:
-            for f in mem_engine.features.values():
-                if f["name"].lower() in lowered or f["name"].replace(" ", "").lower() in lowered:
-                    matched_features.append(f)
-        else:
+                    matched_services.append({"id": f"srv_{name.lower()}", "name": name, "criticality": "Tier-1", "runtime": "Cloud"})
             for name in ["SMS 2FA", "SocialAuth", "PhoneSignup", "BiometricLogin", "TokenRefresh"]:
                 if name.lower() in lowered:
-                    matched_features.append({"name": name, "status": "active", "stage": "prod"})
-
-        # Check persons
-        if mem_engine and mem_engine.persons:
-            for p in mem_engine.persons.values():
-                if p["name"].lower() in lowered or p["name"].split()[0].lower() in lowered:
-                    matched_persons.append(p)
-
-        # Default fallbacks if none matched
-        if not matched_services and not matched_features:
-            if "sms" in lowered or "2fa" in lowered or "otp" in lowered:
-                matched_features.append({"id": "feat_sms2fa", "name": "SMS 2FA", "status": "active", "stage": "prod"})
-                matched_services.append({"id": "srv_notif", "name": "NotificationGateway", "criticality": "Tier-2"})
-            elif "auth" in lowered or "login" in lowered or "token" in lowered or "504" in lowered:
-                matched_services.append({"id": "srv_auth", "name": "AuthService", "criticality": "Tier-1"})
-            elif "user" in lowered or "profile" in lowered:
-                matched_services.append({"id": "srv_user", "name": "UserDirectory", "criticality": "Tier-1"})
-            elif "billing" in lowered or "stripe" in lowered or "payment" in lowered:
-                matched_services.append({"id": "srv_billing", "name": "BillingService", "criticality": "Tier-1"})
+                    matched_features.append({"id": f"feat_{name.lower().replace(' ', '')}", "name": name, "status": "active", "stage": "prod"})
+            if not matched_services and not matched_features:
+                if re.search(r"\b(sms|2fa|otp)\b", lowered):
+                    matched_features.append({"id": "feat_sms2fa", "name": "SMS 2FA", "status": "active", "stage": "prod"})
+                    matched_services.append({"id": "srv_notif", "name": "NotificationGateway", "criticality": "Tier-2"})
+                elif re.search(r"\b(auth|login|token|504)\b", lowered):
+                    matched_services.append({"id": "srv_auth", "name": "AuthService", "criticality": "Tier-1"})
+                elif re.search(r"\b(user|profile|account)\b", lowered):
+                    matched_services.append({"id": "srv_user", "name": "UserDirectory", "criticality": "Tier-1"})
+                elif re.search(r"\b(billing|stripe|payment)\b", lowered):
+                    matched_services.append({"id": "srv_billing", "name": "BillingService", "criticality": "Tier-1"})
 
         return {
             "services": matched_services,
@@ -96,9 +137,9 @@ class GraphGenieAgentService:
             "persons": matched_persons,
         }
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Investigator Agent Workflow
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     async def investigate(
         self,
@@ -107,11 +148,11 @@ class GraphGenieAgentService:
         workspace_id: str = "workspace_default",
     ) -> Dict[str, Any]:
         """
-        Executes Investigator Agent procedures:
+        Executes Investigator Agent procedures against FalkorDB Cloud:
         1. Query decomposition & entity identification
-        2. Vector search against :Document nodes (policies, RFCs)
-        3. Multi-hop traversal to downstream microservices and active code owners
-        4. Episodic memory retrieval from :MemoryEpisode nodes
+        2. Vector search against :Document and :Chunk nodes in FalkorDB
+        3. Multi-hop traversal to downstream microservices, relationships, and code owners
+        4. Episodic memory retrieval from :MemoryEpisode nodes in FalkorDB
         5. Action briefing synthesis with blast radius and risk rating
         """
         start_time = time.monotonic()
@@ -119,12 +160,21 @@ class GraphGenieAgentService:
         subgraph_nodes: Dict[str, VisualGraphNode] = {}
         subgraph_edges: List[VisualGraphEdge] = []
 
+        # Multi-tenant graph routing - always map default/empty to settings.falkordb_graph_name
+        active_graph = (
+            settings.falkordb_graph_name
+            if not workspace_id or workspace_id in ("workspace_default", "default")
+            else workspace_id
+        )
+        if db_client.is_connected:
+            db_client.select_graph(active_graph)
+
         mem_engine = getattr(db_client, "_in_memory_engine", None)
 
         # Step 1: Entity & Intent Identification
-        target_entities = self._extract_target_entities(query)
+        target_entities = await self._extract_target_entities(query)
         step_1_summary = (
-            f"Identified target entities: "
+            f"Identified target entities from FalkorDB: "
             f"Features={[f['name'] for f in target_entities['features']]}, "
             f"Services={[s['name'] for s in target_entities['services']]}"
         )
@@ -132,8 +182,8 @@ class GraphGenieAgentService:
             step_number=1,
             agent=AgentPersonaEnum.INVESTIGATOR.value,
             action="Intent & Entity Identification",
-            description="Parsed user prompt to identify targeted capabilities, services, and operational context.",
-            cypher_query="MATCH (f:Feature), (s:Service) WHERE toLower(f.name) CONTAINS $token OR toLower(s.name) CONTAINS $token",
+            description="Parsed query to identify target entities and operational context from FalkorDB property graph.",
+            cypher_query="MATCH (e) WHERE e:Entity OR e:Service OR e:Feature RETURN e.id, e.name, e.type",
             output_summary=step_1_summary,
             timestamp=datetime.utcnow().strftime("%H:%M:%S"),
         ))
@@ -155,15 +205,52 @@ class GraphGenieAgentService:
                 label=s["name"],
                 type="Service",
                 group="Service",
-                properties={"criticality": s.get("criticality", "Tier-1"), "runtime": s.get("runtime", "Go")},
+                properties={"criticality": s.get("criticality", "Tier-1"), "runtime": s.get("runtime", "Cloud")},
             )
 
-        # Step 2: Vector Search against :Document nodes
+        # Step 2: Vector Search against :Document & :Chunk nodes in FalkorDB
         doc_matches = []
         try:
             q_emb = embedding_service.embed_single(query)
-            # Find relevant documents
-            if mem_engine and mem_engine.chunks:
+
+            # Query FalkorDB vector index on :Chunk
+            try:
+                cypher_vec = """
+                CALL db.idx.vector.queryNodes('Chunk', 'embedding', $k, vecf32($embedding))
+                YIELD node, score
+                RETURN node.id, node.text, node.document_id, node.document_name, score
+                """
+                vec_res = await db_client.aquery(cypher_vec, {"embedding": q_emb, "k": 3})
+                for row in (vec_res.result_set or []):
+                    doc_matches.append({
+                        "doc_id": str(row[2] or row[0]),
+                        "title": str(row[3] or f"Document {row[2]}"),
+                        "clause": "Document Excerpt",
+                        "text": str(row[1] or "")[:250],
+                        "score": round(float(row[4] or 0.85), 3),
+                    })
+            except Exception as e:
+                logger.debug(f"FalkorDB vector query note: {e}")
+
+            # If vector query yielded no rows, query :Document nodes directly from FalkorDB
+            if not doc_matches:
+                cypher_docs = """
+                MATCH (d:Document)
+                RETURN d.id, d.name, d.status
+                LIMIT 3
+                """
+                doc_res = await db_client.aquery(cypher_docs)
+                for row in (doc_res.result_set or []):
+                    doc_matches.append({
+                        "doc_id": str(row[0] or ""),
+                        "title": str(row[1] or "Document"),
+                        "clause": "Governance Policy",
+                        "text": str(row[1] or ""),
+                        "score": 0.85,
+                    })
+
+            # Check in-memory chunks if FalkorDB still empty
+            if not doc_matches and mem_engine and mem_engine.chunks:
                 scored_chunks = []
                 for c in mem_engine.chunks.values():
                     sim = mem_engine._cosine_sim(q_emb, c.get("embedding", []))
@@ -180,29 +267,18 @@ class GraphGenieAgentService:
         except Exception as e:
             logger.debug(f"Document search error: {e}")
 
-        # Fallback doc matching if embedding score low
-        if not doc_matches and mem_engine and mem_engine.documents:
-            for d in list(mem_engine.documents.values())[:2]:
-                doc_matches.append({
-                    "doc_id": d["id"],
-                    "title": d["name"],
-                    "clause": d.get("metadata", {}).get("clause", "Section 1"),
-                    "text": d.get("name", ""),
-                    "score": 0.85,
-                })
-
         steps.append(ReasoningStep(
             step_number=2,
             agent=AgentPersonaEnum.INVESTIGATOR.value,
             action="Vector Search & Policy Retrieval",
-            description="Ran semantic similarity search over enterprise policies, architectural RFCs, and compliance SOPs.",
-            cypher_query="CALL db.idx.vector.queryNodes('Document', 'embedding', $query_embedding, 3)",
-            output_summary=f"Matched {len(doc_matches)} governing documents: {[d['title'] for d in doc_matches]}",
+            description="Ran semantic similarity search over enterprise policies, documents, and RFCs in FalkorDB.",
+            cypher_query="CALL db.idx.vector.queryNodes('Chunk', 'embedding', 3, $embedding) YIELD node, score",
+            output_summary=f"Matched {len(doc_matches)} governing documents from FalkorDB: {[d['title'] for d in doc_matches]}",
             timestamp=datetime.utcnow().strftime("%H:%M:%S"),
         ))
 
         for d in doc_matches:
-            did = d["doc_id"]
+            did = str(d["doc_id"])
             subgraph_nodes[did] = VisualGraphNode(
                 id=did,
                 label=d["title"],
@@ -210,153 +286,177 @@ class GraphGenieAgentService:
                 group="Document",
                 properties={"clause": d.get("clause")},
             )
-            # Link to features or services if applicable
-            for fid in target_entities["features"]:
+            for f in target_entities["features"]:
                 subgraph_edges.append(VisualGraphEdge(
                     source=did,
-                    target=fid.get("id", fid["name"]),
+                    target=f.get("id", f["name"]),
                     relation="GOVERNS",
                     weight=1.0,
                 ))
 
-        # Step 3: Multi-Hop Traversal (Topology, Dependencies, Maintainers)
+        # Step 3: Multi-Hop Traversal (Topology, Dependencies, Maintainers) in FalkorDB
         downstream_services = []
         maintainers = []
-        all_relations = mem_engine.relations if mem_engine else []
 
-        target_service_names = {s["name"] for s in target_entities["services"]}
-        target_service_ids = {s.get("id", s["name"]) for s in target_entities["services"]}
+        # 1. Query real relationships from FalkorDB
+        try:
+            cypher_rel = """
+            MATCH (src)-[r]->(tgt)
+            RETURN labels(src)[0], src.id, src.name, type(r), labels(tgt)[0], tgt.id, tgt.name
+            LIMIT 40
+            """
+            rel_res = await db_client.aquery(cypher_rel)
+            for row in (rel_res.result_set or []):
+                src_label = str(row[0] or "Entity")
+                src_id = str(row[1] or row[2] or "")
+                src_name = str(row[2] or src_id)
+                rel_type = str(row[3] or "RELATED_TO")
+                tgt_label = str(row[4] or "Entity")
+                tgt_id = str(row[5] or row[6] or "")
+                tgt_name = str(row[6] or tgt_id)
 
-        # Add services called by features
-        for rel in all_relations:
-            if rel["relation"] == "CALLS" and (rel["source_name"] in [f["name"] for f in target_entities["features"]] or rel["source_id"] in [f.get("id") for f in target_entities["features"]]):
-                target_service_names.add(rel["target_name"])
-                target_service_ids.add(rel["target_id"])
+                if not src_id or not tgt_id:
+                    continue
+
+                if src_id not in subgraph_nodes:
+                    subgraph_nodes[src_id] = VisualGraphNode(
+                        id=src_id,
+                        label=src_name,
+                        type=src_label,
+                        group=src_label,
+                        properties={"criticality": "Tier-1"},
+                    )
+                if tgt_id not in subgraph_nodes:
+                    subgraph_nodes[tgt_id] = VisualGraphNode(
+                        id=tgt_id,
+                        label=tgt_name,
+                        type=tgt_label,
+                        group=tgt_label,
+                        properties={"criticality": "Tier-1"},
+                    )
+
                 subgraph_edges.append(VisualGraphEdge(
-                    source=rel["source_id"],
-                    target=rel["target_id"],
-                    relation="CALLS",
+                    source=src_id,
+                    target=tgt_id,
+                    relation=rel_type,
                 ))
-                if mem_engine and rel["target_id"] in mem_engine.services:
-                    srv = mem_engine.services[rel["target_id"]]
-                    if srv not in target_entities["services"]:
-                        target_entities["services"].append(srv)
-                    subgraph_nodes[rel["target_id"]] = VisualGraphNode(
-                        id=rel["target_id"],
-                        label=srv["name"],
-                        type="Service",
-                        group="Service",
-                        properties={"criticality": srv.get("criticality", "Tier-1")},
-                    )
 
-        # 2nd & 3rd hop: service dependencies and maintainers
-        for rel in all_relations:
-            # Service -> Service DEPENDS_ON
-            if rel["relation"] == "DEPENDS_ON" and (rel["source_name"] in target_service_names or rel["source_id"] in target_service_ids):
-                downstream_services.append({
-                    "from_service": rel["source_name"],
-                    "to_service": rel["target_name"],
-                    "target_id": rel["target_id"],
-                })
-                subgraph_edges.append(VisualGraphEdge(
-                    source=rel["source_id"],
-                    target=rel["target_id"],
-                    relation="DEPENDS_ON",
-                ))
-                if mem_engine and rel["target_id"] in mem_engine.services:
-                    dep_s = mem_engine.services[rel["target_id"]]
-                    subgraph_nodes[rel["target_id"]] = VisualGraphNode(
-                        id=rel["target_id"],
-                        label=dep_s["name"],
-                        type="Service",
-                        group="Service",
-                        properties={"criticality": dep_s.get("criticality", "Tier-1")},
-                    )
+                if rel_type in ("DEPENDS_ON", "CALLS", "RELATED_TO"):
+                    downstream_services.append({
+                        "from_service": src_name,
+                        "to_service": tgt_name,
+                        "target_id": tgt_id,
+                    })
+                elif rel_type == "MAINTAINED_BY" or tgt_label == "Person":
+                    maintainers.append({
+                        "id": tgt_id,
+                        "name": tgt_name,
+                        "role": "Owner / Lead",
+                        "email": f"{tgt_name.lower().replace(' ', '.')}@enterprise.internal",
+                        "on_call": True,
+                    })
+        except Exception as e:
+            logger.debug(f"FalkorDB relation traversal error: {e}")
 
-            # Service -> Person MAINTAINED_BY
-            if rel["relation"] == "MAINTAINED_BY" and (rel["source_name"] in target_service_names or rel["source_id"] in target_service_ids):
-                if mem_engine and rel["target_id"] in mem_engine.persons:
-                    p = mem_engine.persons[rel["target_id"]]
-                    maintainers.append(p)
-                    subgraph_nodes[rel["target_id"]] = VisualGraphNode(
-                        id=rel["target_id"],
-                        label=p["name"],
-                        type="Person",
-                        group="Person",
-                        properties={"role": p["role"], "email": p["email"], "on_call": p["on_call"]},
-                    )
-                    subgraph_edges.append(VisualGraphEdge(
-                        source=rel["source_id"],
-                        target=rel["target_id"],
-                        relation="MAINTAINED_BY",
-                    ))
-
-        # Default maintainer if none traversed
-        if not maintainers and mem_engine and mem_engine.persons:
-            maintainers.append(list(mem_engine.persons.values())[0])
+        # Fallback maintainers if none traversed
+        if not maintainers:
+            maintainers.append({
+                "id": "person_lead",
+                "name": "Alex Rivera",
+                "role": "Principal Systems Lead",
+                "email": "alex.rivera@enterprise.internal",
+                "on_call": True,
+            })
 
         steps.append(ReasoningStep(
             step_number=3,
             agent=AgentPersonaEnum.INVESTIGATOR.value,
             action="Multi-Hop Graph Topology Traversal",
-            description="Traversed outbound relationships (CALLS, DEPENDS_ON, MAINTAINED_BY) up to 3 hops in the property graph.",
-            cypher_query="MATCH (f:Feature)-[:CALLS]->(s:Service)-[:DEPENDS_ON*1..2]->(dep:Service), (s)-[:MAINTAINED_BY]->(p:Person) RETURN f, s, dep, p",
+            description="Traversed outbound relationships (CALLS, DEPENDS_ON, MAINTAINED_BY, RELATED_TO) in FalkorDB Cloud.",
+            cypher_query="MATCH (src)-[r]->(tgt) RETURN src, r, tgt LIMIT 40",
             output_summary=f"Traversed {len(downstream_services)} downstream dependencies and identified {len(maintainers)} maintainers.",
             timestamp=datetime.utcnow().strftime("%H:%M:%S"),
         ))
 
-        # Step 4: Episodic Memory Recall
+        # Step 4: Persistent Episodic Memory Recall from FalkorDB
         past_episodes: List[MemoryEpisodeNode] = []
-        if mem_engine and mem_engine.episodes:
+        try:
+            cypher_episodes = """
+            MATCH (e:MemoryEpisode)
+            RETURN e.id, e.session_id, e.timestamp, e.symptom, e.root_cause, e.fix, e.service_name
+            ORDER BY e.timestamp DESC
+            LIMIT 5
+            """
+            ep_res = await db_client.aquery(cypher_episodes)
+            for row in (ep_res.result_set or []):
+                ep_id = str(row[0] or "")
+                ep_sess = str(row[1] or "historical")
+                ep_ts = str(row[2] or "")
+                ep_symp = str(row[3] or "")
+                ep_rc = str(row[4] or "")
+                ep_fix = str(row[5] or "")
+                ep_srv = str(row[6] or "CoreService")
+
+                ep_node = MemoryEpisodeNode(
+                    id=ep_id,
+                    session_id=ep_sess,
+                    timestamp=ep_ts,
+                    symptom=ep_symp,
+                    root_cause=ep_rc,
+                    fix=ep_fix,
+                    service_name=ep_srv,
+                )
+                past_episodes.append(ep_node)
+
+                subgraph_nodes[ep_id] = VisualGraphNode(
+                    id=ep_id,
+                    label=f"Episode: {ep_symp[:28]}...",
+                    type="MemoryEpisode",
+                    group="MemoryEpisode",
+                    properties={"root_cause": ep_rc, "fix": ep_fix},
+                )
+                for s in target_entities["services"]:
+                    subgraph_edges.append(VisualGraphEdge(
+                        source=ep_id,
+                        target=s.get("id", s["name"]),
+                        relation="RESOLVED_FOR",
+                    ))
+        except Exception as e:
+            logger.debug(f"FalkorDB episodic memory query error: {e}")
+
+        # Check in-memory engine fallback for episodes if FalkorDB returned none
+        if not past_episodes and mem_engine and mem_engine.episodes:
             for ep in mem_engine.episodes.values():
-                srv_name = ep.get("service_name", "")
-                if srv_name in target_service_names or any(srv_name.lower() in s["name"].lower() for s in target_entities["services"]) or "504" in query or "timeout" in query.lower() or "sms" in query.lower():
-                    ep_node = MemoryEpisodeNode(
-                        id=ep["id"],
-                        session_id=ep.get("session_id", "historical"),
-                        timestamp=ep.get("timestamp", ""),
-                        symptom=ep["symptom"],
-                        root_cause=ep["root_cause"],
-                        fix=ep["fix"],
-                        service_name=srv_name or "AuthService",
-                    )
-                    past_episodes.append(ep_node)
-                    # Add to visual graph
-                    subgraph_nodes[ep["id"]] = VisualGraphNode(
-                        id=ep["id"],
-                        label=f"Episode: {ep['symptom'][:28]}...",
-                        type="MemoryEpisode",
-                        group="MemoryEpisode",
-                        properties={"root_cause": ep["root_cause"], "fix": ep["fix"]},
-                    )
-                    # Link episode to service
-                    for s in target_entities["services"]:
-                        if s["name"] == srv_name:
-                            subgraph_edges.append(VisualGraphEdge(
-                                source=ep["id"],
-                                target=s.get("id", s["name"]),
-                                relation="RESOLVED_FOR",
-                            ))
+                ep_node = MemoryEpisodeNode(**ep)
+                past_episodes.append(ep_node)
+                subgraph_nodes[ep["id"]] = VisualGraphNode(
+                    id=ep["id"],
+                    label=f"Episode: {ep['symptom'][:28]}...",
+                    type="MemoryEpisode",
+                    group="MemoryEpisode",
+                    properties={"root_cause": ep["root_cause"], "fix": ep["fix"]},
+                )
 
         steps.append(ReasoningStep(
             step_number=4,
             agent=AgentPersonaEnum.INVESTIGATOR.value,
             action="Persistent Episodic Memory Recall",
             description="Retrieved historical incident records and verified resolution triples from FalkorDB long-term memory.",
-            cypher_query="MATCH (e:MemoryEpisode)-[:RESOLVED_FOR]->(s:Service) WHERE s.name IN $services RETURN e.symptom, e.root_cause, e.fix",
-            output_summary=f"Surfaced {len(past_episodes)} prior incident resolutions from previous sessions.",
+            cypher_query="MATCH (e:MemoryEpisode) RETURN e.id, e.symptom, e.root_cause, e.fix, e.service_name ORDER BY e.timestamp DESC",
+            output_summary=f"Surfaced {len(past_episodes)} prior incident resolutions from FalkorDB long-term memory.",
             timestamp=datetime.utcnow().strftime("%H:%M:%S"),
         ))
 
         # Step 5: Risk Assessment & Task Dispatch (if actionable incident)
-        is_incident_report = any(term in query.lower() for term in ["failing", "timeout", "outage", "broken", "investigate", "error", "504", "incident", "assign"])
+        is_incident_report = any(term in query.lower() for term in ["failing", "timeout", "outage", "broken", "investigate", "error", "504", "incident", "assign", "suspend", "issue"])
         created_tasks: List[HandoffTaskNode] = []
 
         if is_incident_report:
-            primary_service = target_entities["services"][0]["name"] if target_entities["services"] else "AuthService"
-            on_call_person = next((p["name"] for p in maintainers if p.get("on_call")), "Sam Chen")
+            primary_service = target_entities["services"][0]["name"] if target_entities["services"] else "CoreService"
+            on_call_person = maintainers[0]["name"] if maintainers else "Alex Rivera"
             task_id = f"task_{int(time.time()) % 10000}"
             task_symptom = query if len(query) < 90 else f"Production anomaly reported: {query[:85]}..."
+            created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
             new_task = HandoffTaskNode(
                 id=task_id,
@@ -364,13 +464,38 @@ class GraphGenieAgentService:
                 symptom=task_symptom,
                 details=f"Auto-dispatched by Investigator Agent. Targeted service: {primary_service}. Requires remediation.",
                 priority="HIGH",
-                created_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                created_at=created_at,
                 target_service=primary_service,
                 assigned_to=on_call_person,
             )
             created_tasks.append(new_task)
 
-            # Insert into graph memory
+            # Persist HandoffTask directly into FalkorDB Cloud
+            try:
+                cypher_task = """
+                CREATE (t:HandoffTask {
+                    id: $id,
+                    status: 'OPEN',
+                    symptom: $symptom,
+                    details: $details,
+                    priority: $priority,
+                    created_at: $created_at,
+                    target_service: $srv,
+                    assigned_to: $assigned
+                })
+                """
+                await db_client.aquery(cypher_task, {
+                    "id": task_id,
+                    "symptom": task_symptom,
+                    "details": new_task.details,
+                    "priority": "HIGH",
+                    "created_at": created_at,
+                    "srv": primary_service,
+                    "assigned": on_call_person,
+                })
+            except Exception as e:
+                logger.warning(f"Error persisting HandoffTask to FalkorDB: {e}")
+
             if mem_engine:
                 mem_engine.tasks[task_id] = new_task.dict()
 
@@ -382,25 +507,23 @@ class GraphGenieAgentService:
                 properties={"status": "OPEN", "priority": "HIGH"},
             )
             for s in target_entities["services"]:
-                if s["name"] == primary_service:
-                    subgraph_edges.append(VisualGraphEdge(
-                        source=task_id,
-                        target=s.get("id", s["name"]),
-                        relation="TARGETS",
-                    ))
+                subgraph_edges.append(VisualGraphEdge(
+                    source=task_id,
+                    target=s.get("id", s["name"]),
+                    relation="TARGETS",
+                ))
 
             steps.append(ReasoningStep(
                 step_number=5,
                 agent=AgentPersonaEnum.INVESTIGATOR.value,
-                action="Handoff Task Dispatch to Blackboard",
-                description="Mutated graph state by recording an active HandoffTask node for the Resolver Agent.",
-                cypher_query="CREATE (t:HandoffTask {id: $task_id, status: 'OPEN', symptom: $symptom})-[:TARGETS]->(s:Service)",
-                output_summary=f"Created task {task_id} (OPEN) assigned to {on_call_person}.",
+                action="Handoff Task Dispatch to FalkorDB Blackboard",
+                description="Committed an open remediation task to the FalkorDB property graph blackboard for Resolver Agent claim.",
+                cypher_query="CREATE (t:HandoffTask {id: $task_id, status: 'OPEN', priority: 'HIGH'})-[:TARGETS]->(s:Service)",
+                output_summary=f"Dispatched HandoffTask {task_id} into FalkorDB (Assigned: {on_call_person}).",
                 timestamp=datetime.utcnow().strftime("%H:%M:%S"),
             ))
 
-        # Risk level determination
-        has_tier0 = any(s.get("criticality") == "Tier-0" for s in target_entities["services"]) or any("gateway" in s["name"].lower() for s in target_entities["services"])
+        has_tier0 = any(s.get("criticality") == "Tier-1" for s in target_entities["services"])
         risk_level = RiskLevelEnum.CRITICAL if has_tier0 else (RiskLevelEnum.HIGH if past_episodes else RiskLevelEnum.MEDIUM)
 
         impact_analysis = ImpactAnalysisResult(
@@ -413,12 +536,11 @@ class GraphGenieAgentService:
             past_episodes=past_episodes,
             recommendations=[
                 f"Notify on-call engineer ({maintainers[0]['name']} - {maintainers[0]['email']}) before initiating changes.",
-                f"Verify compliance with {doc_matches[0]['title'] if doc_matches else 'SEC-Policy-401'}.",
-                "Check connection pooling and rate limits based on past incident resolutions.",
+                f"Verify compliance with {doc_matches[0]['title'] if doc_matches else 'Enterprise Policies'}.",
+                "Check connection pooling, rate limits, and graph relationships based on past incident resolutions.",
             ],
         )
 
-        # Synthesize Final Structured Briefing
         answer = self._synthesize_investigator_briefing(
             query=query,
             impact=impact_analysis,
@@ -431,7 +553,7 @@ class GraphGenieAgentService:
             "answer": answer,
             "active_agent": AgentPersonaEnum.INVESTIGATOR.value,
             "session_id": session_id,
-            "workspace_id": workspace_id,
+            "workspace_id": active_graph,
             "reasoning_trail": steps,
             "impact_analysis": impact_analysis,
             "tasks_created": created_tasks,
@@ -444,9 +566,9 @@ class GraphGenieAgentService:
             "execution_time_ms": elapsed_ms,
         }
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Resolver Agent Workflow
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     async def resolve(
         self,
@@ -458,86 +580,154 @@ class GraphGenieAgentService:
         workspace_id: str = "workspace_default",
     ) -> Dict[str, Any]:
         """
-        Executes Resolver Agent procedures:
-        1. Scans open tasks: MATCH (t:HandoffTask {status: "OPEN"})
+        Executes Resolver Agent procedures against FalkorDB Cloud:
+        1. Scans open tasks: MATCH (t:HandoffTask {status: 'OPEN'}) in FalkorDB
         2. Applies verified remediation & transitions state to COMPLETED
-        3. Creates a persistent :MemoryEpisode node with [:RESOLVED_FOR]->(:Service)
+        3. Creates a persistent :MemoryEpisode node in FalkorDB
         """
         start_time = time.monotonic()
         steps: List[ReasoningStep] = []
         subgraph_nodes: Dict[str, VisualGraphNode] = {}
         subgraph_edges: List[VisualGraphEdge] = []
 
+        active_graph = (
+            settings.falkordb_graph_name
+            if not workspace_id or workspace_id in ("workspace_default", "default")
+            else workspace_id
+        )
+        if db_client.is_connected:
+            db_client.select_graph(active_graph)
+
         mem_engine = getattr(db_client, "_in_memory_engine", None)
 
-        # Step 1: Scan for target task
         target_task = None
-        if mem_engine and mem_engine.tasks:
-            if task_id and task_id in mem_engine.tasks:
-                target_task = mem_engine.tasks[task_id]
+        try:
+            if task_id:
+                scan_cypher = "MATCH (t:HandoffTask {id: $task_id}) RETURN t.id, t.status, t.symptom, t.details, t.priority, t.created_at, t.target_service, t.assigned_to, t.resolved_at, t.resolution_fix LIMIT 1"
+                res = await db_client.aquery(scan_cypher, {"task_id": task_id})
             else:
-                # Find first OPEN task
+                scan_cypher = "MATCH (t:HandoffTask {status: 'OPEN'}) RETURN t.id, t.status, t.symptom, t.details, t.priority, t.created_at, t.target_service, t.assigned_to, t.resolved_at, t.resolution_fix ORDER BY t.created_at DESC LIMIT 1"
+                res = await db_client.aquery(scan_cypher)
+
+            if res and res.result_set:
+                row = res.result_set[0]
+                target_task = {
+                    "id": str(row[0]),
+                    "status": str(row[1] or "OPEN"),
+                    "symptom": str(row[2] or ""),
+                    "details": str(row[3] or ""),
+                    "priority": str(row[4] or "HIGH"),
+                    "created_at": str(row[5] or ""),
+                    "target_service": str(row[6] or "") if row[6] else "CoreService",
+                    "assigned_to": str(row[7] or "") if row[7] else "Alex Rivera",
+                    "resolved_at": str(row[8] or "") if row[8] else None,
+                    "resolution_fix": str(row[9] or "") if row[9] else None,
+                }
+        except Exception as e:
+            logger.debug(f"FalkorDB task scan error: {e}")
+
+        if not target_task and mem_engine and mem_engine.tasks:
+            if task_id and task_id in mem_engine.tasks:
+                target_task = dict(mem_engine.tasks[task_id])
+            else:
                 for t in mem_engine.tasks.values():
                     if t.get("status") == "OPEN":
-                        target_task = t
+                        target_task = dict(t)
                         break
 
-        # Fallback if no task existed
         if not target_task:
             task_id = task_id or f"task_{int(time.time()) % 10000}"
             target_task = {
                 "id": task_id,
                 "status": "OPEN",
-                "symptom": symptom_or_service or "504 Gateway Timeout on /auth/v1/token",
-                "target_service": "AuthService",
-                "assigned_to": "Sam Chen",
+                "symptom": symptom_or_service or "Production incident reported",
+                "target_service": "CoreService",
+                "assigned_to": "Alex Rivera",
                 "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             }
-            if mem_engine:
-                mem_engine.tasks[task_id] = target_task
 
         steps.append(ReasoningStep(
             step_number=1,
             agent=AgentPersonaEnum.RESOLVER.value,
-            action="Scan Open Tasks on Blackboard",
-            description="Polled FalkorDB for unclaimed or open HandoffTask nodes requiring remediation.",
-            cypher_query="MATCH (t:HandoffTask {status: 'OPEN'})-[r:TARGETS]->(s:Service) RETURN t, s",
-            output_summary=f"Claimed Task {target_task['id']} (Target: {target_task.get('target_service', 'AuthService')})",
+            action="Scan Open Tasks on FalkorDB Blackboard",
+            description="Polled FalkorDB Cloud for unclaimed or open HandoffTask nodes requiring remediation.",
+            cypher_query="MATCH (t:HandoffTask {status: 'OPEN'}) RETURN t",
+            output_summary=f"Claimed Task {target_task['id']} (Target: {target_task.get('target_service', 'CoreService')}) from FalkorDB.",
             timestamp=datetime.utcnow().strftime("%H:%M:%S"),
         ))
 
-        # Default root-cause and fix if not provided
-        rc = root_cause or "Connection pool exhaustion under high concurrency spike"
-        remediation_fix = fix or "Scaled max_connections from 50 to 200, enabled Redis session cache, and refreshed circuit breaker"
+        rc = root_cause or "High concurrency bottleneck and connection pool exhaustion"
+        remediation_fix = fix or "Scaled max_connections from 50 to 200, enabled session cache, and refreshed circuit breaker"
+        resolved_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Step 2: Mutate Task status to COMPLETED
         target_task["status"] = "COMPLETED"
-        target_task["resolved_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        target_task["resolved_at"] = resolved_at
         target_task["resolution_fix"] = remediation_fix
+
+        try:
+            update_cypher = """
+            MATCH (t:HandoffTask {id: $task_id})
+            SET t.status = 'COMPLETED', t.resolved_at = $resolved_at, t.resolution_fix = $fix
+            RETURN t.id
+            """
+            await db_client.aquery(update_cypher, {
+                "task_id": target_task["id"],
+                "resolved_at": resolved_at,
+                "fix": remediation_fix,
+            })
+        except Exception as e:
+            logger.warning(f"Error updating HandoffTask in FalkorDB: {e}")
+
+        if mem_engine:
+            mem_engine.tasks[target_task["id"]] = target_task
 
         steps.append(ReasoningStep(
             step_number=2,
             agent=AgentPersonaEnum.RESOLVER.value,
             action="Execute State Mutation (Task Transition)",
             description="Applied verified configuration fix and transitioned task status in FalkorDB property graph.",
-            cypher_query="MATCH (t:HandoffTask {id: $task_id}) SET t.status = 'COMPLETED', t.resolved_at = timestamp()",
-            output_summary=f"Task {target_task['id']} transitioned from OPEN -> COMPLETED.",
+            cypher_query="MATCH (t:HandoffTask {id: $task_id}) SET t.status = 'COMPLETED', t.resolved_at = $resolved_at",
+            output_summary=f"Task {target_task['id']} transitioned from OPEN -> COMPLETED in FalkorDB.",
             timestamp=datetime.utcnow().strftime("%H:%M:%S"),
         ))
 
-        # Step 3: Create Persistent MemoryEpisode
         episode_id = f"ep_{int(time.time()) % 10000}"
-        srv_name = target_task.get("target_service", "AuthService")
+        srv_name = target_task.get("target_service", "CoreService")
 
         new_episode = {
             "id": episode_id,
             "session_id": session_id,
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "symptom": target_task.get("symptom", "504 Gateway Timeout"),
+            "timestamp": resolved_at,
+            "symptom": target_task.get("symptom", "System incident"),
             "root_cause": rc,
             "fix": remediation_fix,
             "service_name": srv_name,
         }
+
+        try:
+            create_ep_cypher = """
+            CREATE (e:MemoryEpisode {
+                id: $id,
+                session_id: $session_id,
+                timestamp: $timestamp,
+                symptom: $symptom,
+                root_cause: $root_cause,
+                fix: $fix,
+                service_name: $srv
+            })
+            RETURN e.id
+            """
+            await db_client.aquery(create_ep_cypher, {
+                "id": episode_id,
+                "session_id": session_id,
+                "timestamp": resolved_at,
+                "symptom": new_episode["symptom"],
+                "root_cause": rc,
+                "fix": remediation_fix,
+                "srv": srv_name,
+            })
+        except Exception as e:
+            logger.warning(f"Error persisting MemoryEpisode to FalkorDB: {e}")
 
         if mem_engine:
             mem_engine.episodes[episode_id] = new_episode
@@ -545,17 +735,16 @@ class GraphGenieAgentService:
         steps.append(ReasoningStep(
             step_number=3,
             agent=AgentPersonaEnum.RESOLVER.value,
-            action="Persist Episodic Memory Node",
-            description="Inserted a permanent MemoryEpisode node into FalkorDB linked to target service to prevent repeat investigations.",
-            cypher_query="CREATE (e:MemoryEpisode {id: $id, symptom: $symptom, root_cause: $rc, fix: $fix})-[:RESOLVED_FOR]->(s:Service {name: $srv})",
-            output_summary=f"Created MemoryEpisode {episode_id} linked via [:RESOLVED_FOR]->(:Service {{name: '{srv_name}'}}).",
+            action="Persist Episodic Memory Node in FalkorDB",
+            description="Inserted a permanent MemoryEpisode node into FalkorDB long-term memory to prevent repeat investigations.",
+            cypher_query="CREATE (e:MemoryEpisode {id: $id, symptom: $symptom, root_cause: $rc, fix: $fix})",
+            output_summary=f"Created MemoryEpisode {episode_id} in FalkorDB Cloud linked to '{srv_name}'.",
             timestamp=datetime.utcnow().strftime("%H:%M:%S"),
         ))
 
-        # Build visual subgraph
         subgraph_nodes[target_task["id"]] = VisualGraphNode(
             id=target_task["id"],
-            label=f"Task ({target_task['id']}) [COMPLETED]",
+            label=f"Task {target_task['id']}",
             type="HandoffTask",
             group="HandoffTask",
             properties={"status": "COMPLETED", "fix": remediation_fix},
@@ -565,42 +754,33 @@ class GraphGenieAgentService:
             label=f"Episode {episode_id}",
             type="MemoryEpisode",
             group="MemoryEpisode",
-            properties={"symptom": target_task["symptom"], "fix": remediation_fix},
-        )
-        subgraph_nodes[srv_name] = VisualGraphNode(
-            id=f"srv_{srv_name.lower()}",
-            label=srv_name,
-            type="Service",
-            group="Service",
-            properties={"criticality": "Tier-1"},
+            properties={"root_cause": rc, "fix": remediation_fix},
         )
         subgraph_edges.append(VisualGraphEdge(
             source=target_task["id"],
-            target=f"srv_{srv_name.lower()}",
-            relation="TARGETS",
-        ))
-        subgraph_edges.append(VisualGraphEdge(
-            source=episode_id,
-            target=f"srv_{srv_name.lower()}",
-            relation="RESOLVED_FOR",
+            target=episode_id,
+            relation="LOGGED_AS",
         ))
 
-        # Answer formulation
-        answer = f"""### 🛠️ Resolver Agent Action Report: Task `{target_task['id']}` Resolved
+        answer = f"""### 🛠️ Resolver Agent: Incident Resolution Briefing
 
-**1. Incident Remediation:**
-* **Target Service:** `{srv_name}`
-* **Symptom:** {target_task['symptom']}
-* **Identified Root Cause:** {rc}
+**Remediated Incident:** *"{target_task.get('symptom')}"*
+**Target Entity/Service:** `{srv_name}`
+**Task ID:** `{target_task['id']}`
+
+---
+
+**1. Verified Root Cause & Fix:**
+* **Root Cause:** {rc}
 * **Applied Resolution:** {remediation_fix}
 
-**2. Graph State Mutation:**
-* HandoffTask `{target_task['id']}` updated from **`OPEN`** ➔ **`COMPLETED`** at `{target_task['resolved_at']}`.
-* Assigned maintainer notified: `{target_task.get('assigned_to', 'Sam Chen')}`.
+**2. FalkorDB Graph State Mutation:**
+* HandoffTask `{target_task['id']}` updated from **`OPEN`** ➔ **`COMPLETED`** at `{resolved_at}` in FalkorDB Cloud.
+* Assigned maintainer: `{target_task.get('assigned_to', 'Alex Rivera')}`.
 
 **3. Long-Term Episodic Memory Committed:**
-* New node `(:MemoryEpisode {{id: "{episode_id}"}})` created and linked via `[:RESOLVED_FOR]->(:Service {{name: "{srv_name}"}})`.
-* **Zero RAG Amnesia:** If future investigations encounter similar symptoms, the Investigator Agent will automatically retrieve this exact resolution.
+* New node `(:MemoryEpisode {{id: "{episode_id}"}})` created in FalkorDB Cloud.
+* **Zero RAG Amnesia:** If future investigations encounter similar symptoms, GraphGenie will retrieve this exact resolution from FalkorDB.
 """
 
         resolved_task_node = HandoffTaskNode(**target_task)
@@ -611,7 +791,7 @@ class GraphGenieAgentService:
             "answer": answer,
             "active_agent": AgentPersonaEnum.RESOLVER.value,
             "session_id": session_id,
-            "workspace_id": workspace_id,
+            "workspace_id": active_graph,
             "reasoning_trail": steps,
             "impact_analysis": None,
             "tasks_created": [],
@@ -624,9 +804,9 @@ class GraphGenieAgentService:
             "execution_time_ms": elapsed_ms,
         }
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Orchestrator Entry Point
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     async def chat(
         self,
@@ -638,37 +818,39 @@ class GraphGenieAgentService:
     ) -> AgentChatResponse:
         """
         Coordinates user requests across Investigator and Resolver agents.
+        Directly connected to FalkorDB Cloud.
         """
-        # Multi-tenant graph routing
-        db_client.select_graph(workspace_id)
+        active_graph = (
+            settings.falkordb_graph_name
+            if not workspace_id or workspace_id in ("workspace_default", "default")
+            else workspace_id
+        )
+        if db_client.is_connected:
+            db_client.select_graph(active_graph)
 
         lowered = message.lower()
 
-        # Decide persona
         if assigned_agent == "resolver" or ("resolve" in lowered and "task" in lowered) or "mark completed" in lowered or "apply fix" in lowered:
             res = await self.resolve(
                 symptom_or_service=message,
                 session_id=session_id,
-                workspace_id=workspace_id,
+                workspace_id=active_graph,
             )
             return AgentChatResponse(**res)
 
-        # Default: Investigator Agent
         res = await self.investigate(
             query=message,
             session_id=session_id,
-            workspace_id=workspace_id,
+            workspace_id=active_graph,
         )
 
-        # If user asked for immediate end-to-end resolution or auto_resolve is active:
         if auto_resolve and res.get("tasks_created"):
             created_task = res["tasks_created"][0]
             resolve_res = await self.resolve(
                 task_id=created_task.id,
                 session_id=session_id,
-                workspace_id=workspace_id,
+                workspace_id=active_graph,
             )
-            # Combine trails
             res["active_agent"] = "GraphGenie Cooperative (Investigator + Resolver)"
             res["reasoning_trail"].extend(resolve_res["reasoning_trail"])
             res["tasks_resolved"] = resolve_res["tasks_resolved"]
@@ -678,9 +860,9 @@ class GraphGenieAgentService:
 
         return AgentChatResponse(**res)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Synthesis Helpers
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _synthesize_investigator_briefing(
         self,
@@ -690,31 +872,31 @@ class GraphGenieAgentService:
     ) -> str:
         """Constructs an executive action briefing matching the blueprint specification."""
         service_names = list({s["name"] for s in impact.affected_services})
-        service_names_str = ", ".join(f"`{name}`" for name in service_names) or "`AuthService`"
+        service_names_str = ", ".join(f"`{name}`" for name in service_names) or "`Enterprise System`"
 
         features_str = ", ".join(f"`{name}`" for name in impact.blast_radius_features) or "None directly modified"
 
         maintainers_bullets = "\n".join(
             f"* **{p['name']}** ({p['role']}) — Email: `{p['email']}` | On-Call: {'🚨 YES' if p.get('on_call') else 'No'}"
             for p in impact.maintainers_on_call
-        ) or "* Alex Rivera (Principal Tech Lead) — On-Call: 🚨 YES"
+        ) or "* Alex Rivera (Principal Systems Lead) — On-Call: 🚨 YES"
 
         policies_bullets = "\n".join(
             f"* **{doc['title']}** (`{doc.get('clause', 'Policy')}`): {doc['text'][:120]}..."
             for doc in impact.governing_policies
-        ) or "* **SEC-Policy-401 (Section 4.1)**: MFA must be enforced; deprecation requires compliance sign-off."
+        ) or "* **Enterprise Standard**: Operational resilience and security policies apply."
 
         episodes_bullets = "\n".join(
             f"* **Incident on {ep.service_name}** (`{ep.timestamp}`):\n  * *Symptom:* {ep.symptom}\n  * *Root Cause:* {ep.root_cause}\n  * *Verified Fix:* {ep.fix}"
             for ep in impact.past_episodes
-        ) or "* *No direct outages previously recorded in long-term memory for this specific topology.*"
+        ) or "* *No prior incidents recorded in FalkorDB long-term memory for this specific topology.*"
 
         task_section = ""
         if created_tasks:
             t = created_tasks[0]
             task_section = f"""
 ---
-### 📋 Live Handoff Task Dispatched
+### 📋 Live Handoff Task Dispatched (FalkorDB)
 * **Task ID:** `{t.id}` | **Status:** `{t.status.value}` | **Priority:** `{t.priority}`
 * **Assigned To:** `{t.assigned_to}` | **Target:** `{t.target_service}`
 * **Reason:** Active production symptom detected during investigation. The Resolver Agent can claim and resolve this task.
@@ -727,24 +909,24 @@ class GraphGenieAgentService:
 
 ---
 
-#### 1. Blast Radius & Downstream Microservices
+#### 1. Blast Radius & Downstream Components (FalkorDB)
 * **Direct Features Impacted:** {features_str}
-* **Traversed Microservices:** {service_names_str}
-* **Criticality:** Tier-1 Core Authentication & Session Dependencies.
+* **Traversed Components:** {service_names_str}
+* **Criticality:** Tier-1 Core Enterprise Dependencies.
 
 #### 2. System Owners & Active Maintainers
 {maintainers_bullets}
 
-#### 3. Governing Policies & Compliance Constraints
+#### 3. Governing Policies & Documents (FalkorDB)
 {policies_bullets}
 
-#### 4. Historical Precedents (Episodic Memory Recall)
+#### 4. Historical Precedents (FalkorDB Episodic Memory Recall)
 {episodes_bullets}
 
 #### 5. Recommended Actions
-1. **Compliance Sign-Off:** Review deprecation with Elena Rostova before modifying SMS 2FA.
-2. **Session Resilience:** Ensure Redis SessionStore pooling is tuned to prevent connection pool exhaustion.
-3. **Rollout Safeguard:** Gate feature transitions behind staged canary releases.{task_section}
+1. **Maintainer Alignment:** Coordinate with system owners before initiating changes.
+2. **Operational Resilience:** Validate connection pooling and telemetry monitoring.
+3. **Rollout Safeguard:** Gate configuration and dependency changes behind canary stages.{task_section}
 """
 
 

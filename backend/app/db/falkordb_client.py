@@ -9,6 +9,7 @@ import asyncio
 import json
 import re
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 import numpy as np
 from loguru import logger
 import falkordb
@@ -624,27 +625,25 @@ class FalkorDBClient:
             "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.name)",
             "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.type)",
             "CREATE INDEX IF NOT EXISTS FOR (c:Chunk) ON (c.document_id)",
-            f"""
-            CREATE VECTOR INDEX IF NOT EXISTS FOR (c:Chunk) ON (c.embedding)
-            OPTIONS {{dimension: {settings.embedding_dimension}, similarityFunction: 'cosine'}}
-            """,
-            f"""
-            CREATE VECTOR INDEX IF NOT EXISTS FOR (e:Entity) ON (e.embedding)
-            OPTIONS {{dimension: {settings.embedding_dimension}, similarityFunction: 'cosine'}}
-            """,
-            # GraphGenie schema indexes
-            "CREATE INDEX IF NOT EXISTS FOR (s:Service) ON (s.name)",
-            "CREATE INDEX IF NOT EXISTS FOR (f:Feature) ON (f.name)",
-            "CREATE INDEX IF NOT EXISTS FOR (p:Person) ON (p.name)",
-            "CREATE INDEX IF NOT EXISTS FOR (t:HandoffTask) ON (t.id)",
-            "CREATE INDEX IF NOT EXISTS FOR (e:MemoryEpisode) ON (e.id)",
         ]
 
         for q in schema_queries:
             try:
                 self._graph.query(q.strip())
             except Exception as e:
-                logger.debug(f"Schema init note: {e}")
+                logger.debug(f"Schema index note: {e}")
+
+        # Vector indexes (FalkorDB does not use IF NOT EXISTS for vector indexes)
+        vector_queries = [
+            f"CREATE VECTOR INDEX FOR (c:Chunk) ON (c.embedding) OPTIONS {{dimension: {settings.embedding_dimension}, similarityFunction: 'cosine'}}",
+            f"CREATE VECTOR INDEX FOR (e:Entity) ON (e.embedding) OPTIONS {{dimension: {settings.embedding_dimension}, similarityFunction: 'cosine'}}",
+        ]
+        for vq in vector_queries:
+            try:
+                self._graph.query(vq.strip())
+            except Exception as e:
+                # Normal if vector index already exists
+                logger.debug(f"Vector index initialization note: {e}")
 
         logger.info("FalkorDB schema initialized.")
 

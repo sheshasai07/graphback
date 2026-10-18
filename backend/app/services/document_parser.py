@@ -214,16 +214,28 @@ class DocumentParser:
                 lines.append(f"Columns: {', '.join(headers)}")
 
                 for i, row in df.iterrows():
-                    total_rows += 1
                     row_parts = []
                     for col in df.columns:
                         val = row[col]
                         if pd.notna(val) and str(val).strip():
-                            row_parts.append(f"{col}: {val}")
-                    if row_parts:
-                        lines.append(f"Row {i+1}: " + " | ".join(row_parts))
+                            val_str = str(val).strip()
+                            # Clean float representation like 1200.0 if integer
+                            if isinstance(val, float) and val.is_integer():
+                                val_str = str(int(val))
+                            row_parts.append(f"{col}: {val_str}")
+                    
+                    if not row_parts:
+                        continue
 
-            full_text = "\n".join(lines)
+                    # Filter out aggregate summary/total rows (e.g., TOTAL / AVG)
+                    first_val = row_parts[0].lower()
+                    if "total" in first_val or "avg" in first_val or "average" in first_val:
+                        continue
+
+                    total_rows += 1
+                    lines.append(f"Row {total_rows}: " + " | ".join(row_parts))
+
+            full_text = "\n\n".join(lines)
             metadata = {
                 "type": "excel",
                 "filename": filename,

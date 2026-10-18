@@ -16,6 +16,7 @@ from loguru import logger
 
 from app.models.schemas import IngestionJobResponse, RawTextIngestRequest
 from app.services.ingestion_pipeline import ingestion_pipeline
+from app.services.storage_service import storage_service
 from app.config import settings
 
 router = APIRouter(prefix="/api/v1/ingest", tags=["Ingestion"])
@@ -59,20 +60,20 @@ async def upload_document(
             detail=f"Unsupported file type: {ext}. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
         )
 
-    # Save uploaded file
+    # Save uploaded file via StorageService (local + Zoho Catalyst Cloud File Store)
     doc_id = str(uuid.uuid4())
-    os.makedirs(settings.upload_dir, exist_ok=True)
-    file_path = os.path.join(settings.upload_dir, f"{doc_id}{ext}")
 
     try:
         content = await file.read()
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(status_code=413, detail=f"File too large. Max size: 100 MB")
 
-        async with aiofiles.open(file_path, "wb") as f:
-            await f.write(content)
-
-        logger.info(f"Saved upload: {filename} -> {file_path} ({len(content):,} bytes)")
+        storage_info = await storage_service.save_file(
+            file_content=content,
+            filename=filename,
+            doc_id=doc_id,
+        )
+        file_path = storage_info["local_path"]
 
     except HTTPException:
         raise
@@ -93,6 +94,7 @@ async def upload_document(
             enable_llm_extraction=enable_llm_extraction,
             llm_model=llm_model,
             graph_name=graph_name,
+            storage_info=storage_info,
         )
         # Return initial pending status
         return {
@@ -120,6 +122,7 @@ async def upload_document(
             enable_llm_extraction=enable_llm_extraction,
             llm_model=llm_model,
             graph_name=graph_name,
+            storage_info=storage_info,
         )
         return progress.to_dict()
 
@@ -226,3 +229,13 @@ async def stream_ingestion_status(doc_id: str):
 async def list_ingestion_jobs():
     """List all ingestion jobs and their current status."""
     return ingestion_pipeline.get_all_jobs()
+
+
+@router.get("/storage/status")
+async def get_storage_status():
+    """
+    Check whether Zoho Catalyst File Store is configured and test cloud connectivity.
+    Returns connection status and folder details if configured, or unconfigured status.
+    """
+    return await storage_service.test_connection()
+

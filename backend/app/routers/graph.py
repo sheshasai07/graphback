@@ -5,6 +5,7 @@ Used for the knowledge graph visualization panel in the UI.
 """
 
 import json
+import os
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from loguru import logger
@@ -18,6 +19,8 @@ from app.models.schemas import (
 )
 from app.services.graph_retriever import graph_retriever
 from app.services.graph_builder import graph_builder
+from app.services.storage_service import storage_service
+from app.config import settings
 
 router = APIRouter(prefix="/api/v1/graph", tags=["Graph"])
 
@@ -75,15 +78,29 @@ async def list_documents(
 
 @router.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    """Delete a document and all its associated chunks from the graph."""
+    """Delete a document and all its associated chunks from the graph and cloud storage."""
     try:
-        # Verify document exists
+        # Verify document exists and fetch metadata
         check = await db_client.aquery(
-            "MATCH (d:Document {id: $id}) RETURN d.id",
+            "MATCH (d:Document {id: $id}) RETURN d.id, d.name, d.metadata",
             {"id": doc_id}
         )
         if not check.result_set:
             raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+
+        row = check.result_set[0]
+        name = row[1] or ""
+        meta = {}
+        try:
+            meta = json.loads(row[2]) if row[2] else {}
+        except Exception:
+            pass
+
+        # Clean up storage (local file + Zoho Catalyst cloud file)
+        ext = os.path.splitext(name)[1].lower() if name else ""
+        local_path = os.path.join(settings.upload_dir, f"{doc_id}{ext}")
+        catalyst_file_id = meta.get("catalyst_file_id")
+        await storage_service.delete_file(local_path=local_path, catalyst_file_id=catalyst_file_id)
 
         await graph_builder.delete_document(doc_id)
         return {"message": f"Document {doc_id} deleted successfully"}

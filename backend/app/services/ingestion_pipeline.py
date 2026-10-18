@@ -89,6 +89,7 @@ class IngestionPipeline:
         enable_llm_extraction: bool = False,
         llm_model: Optional[str] = None,
         graph_name: Optional[str] = None,
+        storage_info: Optional[Dict[str, Any]] = None,
     ) -> IngestionProgress:
         """
         Run the full ingestion pipeline for a document file with user-configured parameters.
@@ -119,6 +120,13 @@ class IngestionPipeline:
 
             doc_metadata["file_size"] = os.path.getsize(file_path)
             doc_metadata["original_filename"] = filename
+            if storage_info:
+                doc_metadata.update({
+                    "storage_type": storage_info.get("storage_type", "local"),
+                    "catalyst_file_id": storage_info.get("catalyst_file_id"),
+                    "catalyst_folder_id": storage_info.get("catalyst_folder_id"),
+                    "catalyst_download_url": storage_info.get("catalyst_download_url"),
+                })
 
             # ─── Step 2: Create Document Node ─────────────────────────────────
             await graph_builder.create_document_node(
@@ -229,33 +237,22 @@ class IngestionPipeline:
                     except Exception:
                         pass
         else:
-            # LLM-powered extraction (for tough/complex documents)
-            logger.info(f"[{progress.doc_id}] Running LLM entity extraction ({llm_model or 'default'})...")
-            EXTRACT_CONCURRENCY = 2
-            semaphore = asyncio.Semaphore(EXTRACT_CONCURRENCY)
-
-            async def extract_one(chunk: TextChunk):
-                async with semaphore:
+            # LLM-powered extraction: process ALL document chunks in 1 single batched LLM request
+            # Prevents OpenRouter rate limits (RPM / 429 errors) and provides faster, cost-controlled extraction
+            logger.info(f"[{progress.doc_id}] Running batched LLM entity extraction for {len(chunks)} chunks in 1 call ({llm_model or 'default'})...")
+            batch_results = await llm_service.extract_entities_and_relations_batch(
+                chunks=chunks,
+                model=llm_model,
+            )
+            for chunk in chunks:
+                ents, rels = batch_results.get(chunk.id, ([], []))
+                extracted_data.append((chunk, ents, rels))
+                progress.processed_chunks += 1
+                if progress_callback:
                     try:
-                        ents, rels = await llm_service.extract_entities_and_relations(
-                            text=chunk.text,
-                            chunk_id=chunk.id,
-                            model=llm_model,
-                        )
-                        extracted_data.append((chunk, ents, rels))
-                        progress.processed_chunks += 1
-                        if progress_callback:
-                            try:
-                                asyncio.create_task(progress_callback(progress))
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        logger.warning(f"Chunk {chunk.id} extraction error: {e}")
-                        extracted_data.append((chunk, [], []))
-                        progress.processed_chunks += 1
-
-            tasks = [extract_one(chunk) for chunk in chunks]
-            await asyncio.gather(*tasks)
+                        asyncio.create_task(progress_callback(progress))
+                    except Exception:
+                        pass
 
         # ─── 4) Batch embed ALL unique entities at once (1 Voyage API call) ───
         unique_entities: Dict[str, Dict] = {}

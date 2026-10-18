@@ -13,7 +13,6 @@ from loguru import logger
 from app.config import settings
 from app.db.falkordb_client import db_client
 from app.routers import health, ingest, query, graph, agent
-from app.services.seed_data import seed_graphgenie_database
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,18 +23,17 @@ from app.services.seed_data import seed_graphgenie_database
 async def lifespan(app: FastAPI):
     """
     Application lifespan handler.
-    - Startup: Connect to FalkorDB, initialize schema, seed GraphGenie topology, pre-load embedding model
+    - Startup: Connect to FalkorDB, initialize schema, pre-load embedding model
     - Shutdown: Close DB connection
     """
     logger.info("🚀 GraphGenie Backend starting up...")
 
-    # 1) Connect to FalkorDB & Seed Domain Graph
+    # 1) Connect to FalkorDB & Initialize Schema
     try:
         db_client.connect()
         db_client.initialize_schema()
-        seed_graphgenie_database()
     except Exception as e:
-        logger.error(f"FalkorDB startup / seeding failed: {e}")
+        logger.error(f"FalkorDB startup failed: {e}")
         logger.warning("Running without FalkorDB — queries will use In-Memory fallback")
 
     # 2) Pre-warm embedding model (lazy-load in background)

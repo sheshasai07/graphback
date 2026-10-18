@@ -42,6 +42,7 @@ class LLMService:
             self._client = AsyncOpenAI(
                 api_key=clean_key,
                 base_url=settings.openrouter_base_url,
+                timeout=120.0,
                 default_headers={
                     "HTTP-Referer": "http://localhost:5173",
                     "X-Title": "GraphRAG Knowledge Assistant",
@@ -222,6 +223,133 @@ Return JSON only."""
         except Exception as e:
             logger.warning(f"LLM extraction error for chunk {chunk_id}: {e}. Falling back to heuristic extractor.")
             return self._heuristic_extract(text)
+
+    # -------------------------------------------------------------------------
+    # Batch Entity & Relation Extraction (All Chunks in 1 LLM Call)
+    # -------------------------------------------------------------------------
+
+    async def extract_entities_and_relations_batch(
+        self,
+        chunks: List[Any],
+        model: Optional[str] = None,
+    ) -> Dict[str, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+        """
+        Extract entities and relationships from ALL document chunks in a single batched LLM call.
+        Eliminates OpenRouter rate limiting / 429 errors for POC and small-to-medium documents.
+        Returns a mapping of chunk_id -> (entities, relations).
+        """
+        results: Dict[str, Tuple[List[Dict], List[Dict]]] = {}
+        if not chunks:
+            return results
+
+        if not self._has_api_key():
+            logger.info("OpenRouter API key not configured, using offline extractor for batch.")
+            from app.services.offline_extractor import offline_extractor
+            for c in chunks:
+                results[c.id] = offline_extractor.extract_entities_and_relations(c.text, c.id)
+            return results
+
+        # Format all chunks into a structured batch block
+        chunks_payload = []
+        for i, c in enumerate(chunks):
+            chunks_payload.append(f"--- CHUNK ID: {c.id} (Index: {i}) ---\n{c.text}")
+        combined_text = "\n\n".join(chunks_payload)
+
+        system_prompt = """You are an expert enterprise knowledge graph construction AI.
+Your task is to extract all core domain entities and relationships from multiple document chunks in a single pass.
+
+ENTITY TYPES: Person, Organization, Department, Role, Status, Device, AccessLevel, Technology, Concept, Service, Feature, Other
+RELATION TYPES: MEMBER_OF, HAS_ROLE, ACCOUNT_STATUS, ASSIGNED_DEVICE, HAS_ACCESS_LEVEL, HAS_ID, DEPENDS_ON, CALLS, MANAGES, USES, PART_OF, RELATED_TO
+
+CRITICAL RULES:
+- Extract meaningful domain entities (e.g., names of people, departments, roles, devices, statuses, access levels, systems).
+- DO NOT extract dates (e.g. "2026-08-31"), numeric quantities, currency amounts ($1,200), booleans (Yes/No), or file headers as entities.
+- Attributes (email, password reset date, ticket counts, license costs) must be included inside the primary entity's "description" field.
+- Associate each extracted entity and relation with the specific chunk_id where it appears.
+- Return ONLY valid JSON, no markdown codeblocks, no explanations.
+
+OUTPUT FORMAT:
+{
+  "chunks": [
+    {
+      "chunk_id": "<chunk_id>",
+      "entities": [
+        {"name": "Aditya Reddy", "type": "Person", "description": "Helpdesk Technician in IT Support & Ops, Status: Suspended, Device: MacBook Air M3, Reset: 2026-06-11"}
+      ],
+      "relations": [
+        {"source": "Aditya Reddy", "relation": "ACCOUNT_STATUS", "target": "Suspended", "weight": 1.0}
+      ]
+    }
+  ]
+}"""
+
+        user_prompt = f"""Extract entities and relationships for each chunk below:
+
+{combined_text}
+
+Return JSON only conforming to the specified format."""
+
+        try:
+            logger.info(f"Sending 1 single batched LLM extraction call for {len(chunks)} chunks to OpenRouter...")
+            raw = await self._chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+                max_tokens=4096,
+                model=model,
+            )
+
+            # Robust JSON extraction
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+            else:
+                raw_clean = re.sub(r"```json\s*|\s*```", "", raw).strip()
+                data = json.loads(raw_clean)
+
+            # Case A: Model returned format with "chunks"
+            if "chunks" in data and isinstance(data["chunks"], list):
+                for chunk_item in data["chunks"]:
+                    cid = chunk_item.get("chunk_id")
+                    ents = chunk_item.get("entities", [])[:max(100, settings.max_entities_per_chunk)]
+                    rels = chunk_item.get("relations", [])[:max(150, settings.max_relations_per_chunk)]
+                    if cid:
+                        results[cid] = (ents, rels)
+
+            # Case B: Model returned global "entities" and "relations"
+            elif "entities" in data or "relations" in data:
+                all_ents = data.get("entities", [])
+                all_rels = data.get("relations", [])
+                for c in chunks:
+                    chunk_ents = [
+                        e for e in all_ents
+                        if e.get("name", "").lower() in c.text.lower()
+                    ][:max(100, settings.max_entities_per_chunk)]
+                    chunk_ent_names = {e.get("name") for e in chunk_ents}
+                    chunk_rels = [
+                        r for r in all_rels
+                        if r.get("source") in chunk_ent_names or r.get("target") in chunk_ent_names
+                    ][:max(150, settings.max_relations_per_chunk)]
+                    results[c.id] = (chunk_ents, chunk_rels)
+
+            # Fallback for any chunks not parsed in output
+            from app.services.offline_extractor import offline_extractor
+            for c in chunks:
+                if c.id not in results:
+                    results[c.id] = offline_extractor.extract_entities_and_relations(c.text, c.id)
+
+            logger.info(f"Batched LLM extraction successful: extracted entities for {len(results)} chunks in 1 call.")
+            return results
+
+        except Exception as e:
+            logger.warning(f"Batched LLM extraction failed ({e}). Falling back to offline extractor for all chunks.")
+            from app.services.offline_extractor import offline_extractor
+            for c in chunks:
+                results[c.id] = offline_extractor.extract_entities_and_relations(c.text, c.id)
+            return results
+
 
     # -------------------------------------------------------------------------
     # Answer Synthesis (GraphRAG)

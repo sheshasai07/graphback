@@ -62,5 +62,15 @@ class Settings(BaseSettings):
     # --- Paths ---
     upload_dir: str = Field(default="./uploads")
 
+    # --- Zoho Catalyst File Store (Cloud Storage) ---
+    catalyst_project_id: str = Field(default="", description="Zoho Catalyst Project ID")
+    catalyst_folder_id: str = Field(default="", description="Zoho Catalyst File Store Folder ID")
+    catalyst_environment: str = Field(default="development", description="Zoho Catalyst environment (development/production)")
+    catalyst_api_domain: str = Field(default="api.catalyst.zoho.com", description="Zoho Catalyst API domain")
+    catalyst_accounts_url: str = Field(default="https://accounts.zoho.com", description="Zoho Accounts URL for OAuth token exchange")
+    catalyst_client_id: str = Field(default="", description="Zoho OAuth Client ID")
+    catalyst_client_secret: str = Field(default="", description="Zoho OAuth Client Secret")
+    catalyst_refresh_token: str = Field(default="", description="Zoho OAuth Refresh Token")
+
 
 settings = Settings()

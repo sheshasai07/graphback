@@ -125,7 +125,7 @@ class TextChunker:
         return text.strip()
 
     def _split_paragraphs(self, text: str, chunk_size: int = None) -> List[str]:
-        """Split text into paragraph-level units."""
+        """Split text into paragraph-level units, preserving tabular rows intact."""
         target_size = chunk_size or self.chunk_size
         paragraphs = re.split(r"\n{2,}", text)
         result = []
@@ -133,8 +133,12 @@ class TextChunker:
             para = para.strip()
             if not para:
                 continue
-            # If paragraph is too long, split into sentences
-            if self._estimate_tokens(para) > target_size * 1.5:
+
+            # Tabular data protection: never slice rows at decimals or emails
+            if " | " in para and (":" in para or "Row " in para):
+                sub_lines = [l.strip() for l in para.split("\n") if l.strip()]
+                result.extend(sub_lines)
+            elif self._estimate_tokens(para) > target_size * 1.5:
                 sentences = self._split_sentences(para)
                 result.extend(sentences)
             else:
