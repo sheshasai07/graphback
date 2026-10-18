@@ -44,7 +44,7 @@ ORDER BY score DESC;
 
 
 
-2. Multi-Hop Neighborhood Traversal & shortestPath() Algorithm
+### 2. Multi-Hop Neighborhood Traversal & shortestPath() Algorithm
 
 '''cypher
 MATCH path = (src)-[r*1..2]-(tgt)
@@ -61,7 +61,7 @@ RETURN [n IN nodes(p) | n.name] AS path_nodes, length(p) AS hops
 ORDER BY hops ASC LIMIT 1;
 
 
-3. Multi-Agent Blackboard Handoff & Episodic Memory Persistence
+### 3. Multi-Agent Blackboard Handoff & Episodic Memory Persistence
 
 '''cypher
 // Investigator Agent dispatches OPEN task
@@ -81,7 +81,7 @@ FOREACH (_ IN CASE WHEN s IS NOT NULL THEN [1] ELSE [] END | MERGE (e)-[:RESOLVE
 
 
 
-4.Live Semantic Ownership Mutation
+### 4.Live Semantic Ownership Mutation
 
 '''cypher
 MERGE (new_m:Entity {name: $new_maintainer})
