@@ -4,11 +4,11 @@ pydantic==2.9.2
 pydantic-settings==2.5.2
 
 # FalkorDB
-falkordb==1.0.14
+falkordb==1.8.0
 
 # LLM - OpenRouter
 openai==1.51.0
-httpx==0.27.2
+httpx>=0.27.0
 
 # Embeddings - Voyage AI API (voyage-4-lite)
 voyageai>=0.3.2
