@@ -33,7 +33,7 @@ class Settings(BaseSettings):
         description="OpenRouter base URL"
     )
     openrouter_model: str = Field(
-        default="nvidia/nemotron-3.5-super-vl:free",
+        default="nvidia/nemotron-3-ultra-550b-a55b:free",
         description="OpenRouter model for generation and entity extraction"
     )
 
