@@ -66,7 +66,7 @@ class QueryRequest(BaseModel):
     temperature: float = Field(default=0.2, ge=0.0, le=2.0, description="LLM sampling temperature")
     top_p: float = Field(default=0.9, ge=0.0, le=1.0, description="LLM nucleus sampling top_p")
     max_tokens: int = Field(default=1024, ge=64, le=8192, description="Max generation tokens")
-    llm_model: Optional[str] = Field(default=None, description="OpenRouter model (e.g. nvidia/nemotron-3-super-120b-a12b:free)")
+    llm_model: Optional[str] = Field(default=None, description="OpenRouter model (e.g. nvidia/nemotron-3-ultra-550b-a55b:free)")
     embedding_model: Optional[str] = Field(default=None, description="Voyage AI model (e.g. voyage-4-lite)")
     graph_name: Optional[str] = Field(default=None, description="Target FalkorDB graph workspace")
     stream: bool = Field(default=False, description="Stream the response (SSE)")
