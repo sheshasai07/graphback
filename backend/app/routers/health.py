@@ -86,7 +86,7 @@ async def get_rag_options():
             {"id": "voyage-large-2-instruct", "name": "Voyage Large 2 Instruct (1536-dim)", "provider": "Voyage AI", "dimension": 1536},
         ],
         "llm_models": [
-            {"id": "nvidia/nemotron-3-super-120b-a12b:free", "name": "Nvidia Nemotron 120B (Free)", "provider": "OpenRouter"},
+            {"id": "nvidia/nemotron-3-ultra-550b-a55b:free", "name": "NVIDIA: Nemotron 3 Ultra (free)", "provider": "OpenRouter"},
             {"id": "meta-llama/llama-3.3-70b-instruct:free", "name": "Meta Llama 3.3 70B Instruct (Free)", "provider": "OpenRouter"},
             {"id": "google/gemini-2.0-flash-exp:free", "name": "Google Gemini 2.0 Flash (Free)", "provider": "OpenRouter"},
             {"id": "deepseek/deepseek-r1:free", "name": "DeepSeek R1 (Free)", "provider": "OpenRouter"},
